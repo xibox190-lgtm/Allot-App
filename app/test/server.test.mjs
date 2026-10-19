@@ -1,0 +1,72 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { createServer } from 'node:http';
+import { spawn } from 'node:child_process';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { once } from 'node:events';
+import { emptyState } from '../public/modules/domain.mjs';
+import { runAgent } from '../public/modules/agent.mjs';
+
+test('HTTP transport: private config, multimodal tool round-trip, upstream failure and origin checks', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'allot-test-'));
+  let failed = false, calls = 0;
+  const upstream = createServer(async (req, res) => {
+    assert.equal(req.url, '/chat/completions');
+    assert.equal(req.headers.authorization, 'Bearer test-only-placeholder');
+    let raw = ''; for await (const chunk of req) raw += chunk;
+    const payload = JSON.parse(raw);
+    assert.equal(payload.model, 'deepseek-flash');
+    assert.equal(payload.thinking.type, 'disabled');
+    assert.equal(payload.messages[1].content[1].type, 'image_url');
+    if (failed) { res.writeHead(401); res.end('test upstream error'); return; }
+    res.setHeader('Content-Type', 'application/json');
+    if (calls++ === 0) res.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content: null, tool_calls: [{ id: 'create', type: 'function', function: { name: 'create_draft', arguments: JSON.stringify({ assets: [{ id: 'gold', name: '黄金', kind: 'investment' }], months: [{ month: '2026-10', allocations: [{ assetId: 'gold', amount: '1000' }] }], notes: '' }) } }] } }] }));
+    else { assert.equal(payload.messages.at(-1).role, 'tool'); res.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content: '请确认草稿。' } }] })); }
+  });
+  upstream.listen(0, '127.0.0.1'); await once(upstream, 'listening');
+  const env = { ...process.env, PORT: '0', ALLOT_CONFIG_DIR: directory };
+  delete env.DEEPSEEK_API_KEY; delete env.ALLOT_MODEL; delete env.ALLOT_API_BASE;
+  const child = spawn(process.execPath, ['app/server.mjs'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+  t.after(async () => { child.kill(); await new Promise(resolve => upstream.close(resolve)); await rm(directory, { recursive: true, force: true }); });
+  const base = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('server startup timed out')), 5000);
+    child.stdout.on('data', data => { const match = String(data).match(/http:\/\/127\.0\.0\.1:\d+/); if (match) { clearTimeout(timer); resolve(match[0]); } });
+    child.on('error', reject);
+  });
+  const post = (path, data, headers = {}) => fetch(base + path, { method: 'POST', headers: { 'Content-Type': 'application/json', ...headers }, body: JSON.stringify(data) });
+  assert.equal((await post('/api/model', {})).status, 503);
+  const configured = await post('/api/config', { baseUrl: `http://127.0.0.1:${upstream.address().port}`, model: 'deepseek-flash' });
+  assert.equal(configured.status, 200);
+  assert.equal((await configured.json()).configured, false);
+  assert.equal((await post('/api/key', { apiKey: 'test-only-placeholder' })).status, 200);
+  const config = await (await fetch(base + '/api/config')).json();
+  assert.equal(config.configured, true); assert.equal(config.apiKey, undefined);
+  assert.equal((await post('/api/config', {}, { Origin: 'https://outside.example' })).status, 403);
+  const index = await fetch(base + '/');
+  assert.equal(index.status, 200);
+  const script = (await index.text()).match(/src="([^"]+\.js)"/)[1];
+  const asset = await fetch(new URL(script, base + '/'));
+  assert.equal(asset.status, 200);
+  assert.match(asset.headers.get('content-type'), /javascript/);
+  assert.equal((await fetch(base + '/.allot/config.json')).status, 404);
+  const history = [{ role: 'user', content: [{ type: 'text', text: '整理计划' }, { type: 'image_url', image_url: { url: 'data:image/png;base64,AA==' } }] }];
+  const transport = async payload => { const response = await post('/api/model', payload); const data = await response.json(); if (!response.ok) throw new Error(data.error); return data; };
+  const original = emptyState(); const result = await runAgent(original, history, transport);
+  assert.equal(calls, 2); assert.equal(result.state.draft.months[0].targets.gold, 100000);
+  assert.equal(result.state.plan, null); assert.equal(original.draft, null);
+  failed = true; await assert.rejects(runAgent(original, history, transport), /401/);
+  assert.equal(original.draft, null);
+  assert.equal((await fetch(base + '/api/key', { method: 'DELETE', headers: { Origin: 'https://outside.example' } })).status, 403);
+  assert.equal((await (await fetch(base + '/api/config')).json()).configured, true);
+  assert.equal((await post('/api/config', { baseUrl: config.baseUrl, model: config.model })).status, 200);
+  assert.equal((await (await fetch(base + '/api/config')).json()).configured, true);
+  assert.equal((await post('/api/key', { apiKey: '' })).status, 400);
+  assert.equal((await fetch(base + '/api/config', { method: 'DELETE' })).status, 405);
+  assert.equal((await fetch(base + '/api/key', { method: 'DELETE' })).status, 200);
+  assert.deepEqual(await (await fetch(base + '/api/config')).json(), { baseUrl: config.baseUrl, model: config.model, configured: false });
+  assert.equal((await post('/api/model', {})).status, 503);
+  assert.equal((await post('/api/key', { apiKey: 'replacement-test-key' })).status, 200);
+  assert.deepEqual(await (await fetch(base + '/api/config')).json(), config);
+});

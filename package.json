@@ -1,0 +1,32 @@
+{
+  "name": "allot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "vendor": "node scripts/vendor.mjs",
+    "postinstall": "npm run vendor",
+    "start": "node app/server.mjs",
+    "prototype": "node prototype/server.mjs",
+    "test": "npm run build && node --test prototype/test/*.test.mjs app/test/*.test.mjs",
+    "android:build": "npm run build && powershell -NoProfile -ExecutionPolicy Bypass -File android/build.ps1",
+    "build": "npm run vendor && vite build",
+    "prestart": "npm run build",
+    "test:ui": "npm run build && node scripts/test-sheets.mjs",
+    "opensource:export": "node scripts/export-open-source.mjs"
+  },
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0"
+  },
+  "dependencies": {
+    "dompurify": "3.4.16",
+    "marked": "18.1.0",
+    "vue": "^3.5.44"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^6.0.10",
+    "vite": "^8.3.4"
+  },
+  "license": "MIT",
+  "description": "Local-first personal investment planning and purchase records."
+}
